@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Rizztalk</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <h1>Welcome to Rizztalk</h1>
+    <button id="joinQueue">Join Queue</button>
+    <button id="leaveQueue">Leave Queue</button>
+    <button id="skipUser" class="hidden">Skip User</button>
+    <button id="muteAudio" class="hidden">Mute</button>
+    <div id="status"></div>
+    <audio id="remoteAudio" autoplay></audio>
+    <div id="debug"></div>
+
+    <script>
+        const socket = io();
+        const statusDiv = document.getElementById('status');
+        const remoteAudio = document.getElementById('remoteAudio');
+        const debugDiv = document.getElementById('debug');
+        const skipUserButton = document.getElementById('skipUser');
+        const muteAudioButton = document.getElementById('muteAudio');
+        let peerConnection;
+        let partnerId;
+        let localStream;
+        let isMuted = false;
+
+        function log(message) {
+            console.log(message);
+            debugDiv.innerHTML += message + '<br>';
+        }
+
+        function resetUI() {
+            skipUserButton.classList.add('hidden');
+            muteAudioButton.classList.add('hidden');
+            closeConnection();
+            remoteAudio.srcObject = null;
+        }
+
+        function closeConnection() {
+            if (peerConnection) {
+                peerConnection.onicecandidate = null;
+                peerConnection.ontrack = null;
+                peerConnection.onconnectionstatechange = null;
+                peerConnection.close();
+                peerConnection = null;
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+        }
+
+        document.getElementById('joinQueue').addEventListener('click', () => {
+            socket.emit('join queue');
+            log('Joined queue');
+        });
+
+        document.getElementById('leaveQueue').addEventListener('click', () => {
+            socket.emit('leave queue');
+            log('Left queue');
+            resetUI();
+        });
+
+        skipUserButton.addEventListener('click', () => {
+            socket.emit('skip user');
+            log('Skipped current user');
+            statusDiv.innerHTML = 'Skipped user. Rejoining queue...';
+            resetUI();
+        });
+
+        muteAudioButton.addEventListener('click', () => {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                isMuted = !isMuted;
+                audioTrack.enabled = !isMuted;
+                muteAudioButton.textContent = isMuted ? 'Unmute' : 'Mute';
+                log(isMuted ? 'Audio muted' : 'Audio unmuted');
+            }
+        });
+
+        socket.on('connect', () => {
+            log('Connected to server. Socket ID: ' + socket.id);
+        });
+
+        socket.on('queue status', (data) => {
+            statusDiv.innerHTML = data.message;
+            log('Queue status: ' + data.status);
+        });
+
+        socket.on('match found', async (data) => {
+            statusDiv.innerHTML = 'Match found! Connecting...';
+            partnerId = data.partner;
+            log('Match found. Partner ID: ' + partnerId);
+            skipUserButton.classList.remove('hidden');
+            muteAudioButton.classList.remove('hidden');
+            await startCall();
+        });
+
+        socket.on('partner skipped', () => {
+            statusDiv.innerHTML = 'Your partner skipped. You have been placed back in the queue.';
+            log('Partner skipped');
+            resetUI();
+        });
+
+        socket.on('offer', async (offer, senderId) => {
+            log('Received offer from ' + senderId);
+            if (!peerConnection) {
+                await setupPeerConnection();
+            }
+            if (peerConnection.signalingState === 'stable') {
+                log('Cannot set remote offer: connection in stable state');
+                return;
+            }
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            socket.emit('answer', answer, senderId);
+            log('Sent answer to ' + senderId);
+        });
+
+        socket.on('answer', async (answer, senderId) => {
+            log('Received answer from ' + senderId);
+            if (peerConnection.signalingState === 'have-local-offer') {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+            } else {
+                log('Cannot set remote answer: signaling state is ' + peerConnection.signalingState);
+            }
+        });
+
+        socket.on('ice-candidate', async (candidate, senderId) => {
+            log('Received ICE candidate from ' + senderId);
+            if (peerConnection) {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+        });
+
+        async function setupPeerConnection() {
+            log('Setting up peer connection...');
+            const configuration = {'iceServers': [{'urls': 'stun:stun.l.google.com:19302'}]};
+            peerConnection = new RTCPeerConnection(configuration);
+
+            peerConnection.onicecandidate = event => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', event.candidate, partnerId);
+                    log('Sent ICE candidate to ' + partnerId);
+                }
+            };
+
+            peerConnection.ontrack = event => {
+                log('Received remote track');
+                remoteAudio.srcObject = event.streams[0];
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                log('Connection state changed: ' + peerConnection.connectionState);
+                if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed') {
+                    log('Connection failed or disconnected, resetting UI');
+                    resetUI();
+                }
+            };
+
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({audio: true});
+                log('Got local audio stream');
+                localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+            } catch (err) {
+                log('Error accessing media devices: ' + err);
+                statusDiv.innerHTML = 'Error accessing microphone. Please ensure it\'s connected and you\'ve granted permission.';
+            }
+
+            return peerConnection;
+        }
+
+        async function startCall() {
+            log('Starting call...');
+            await setupPeerConnection();
+
+            try {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                socket.emit('offer', offer, partnerId);
+                log('Sent offer to ' + partnerId);
+            } catch (err) {
+                log('Error creating offer: ' + err);
+                statusDiv.innerHTML = 'Error starting call. Please try again.';
+            }
+        }
+    </script>
+</body>
+</html>
